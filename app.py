@@ -1,225 +1,133 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
-from datetime import datetime, timedelta
-import folium
-from streamlit_folium import folium_static
-from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.datasets import load_wine
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler
 
 # -------------------------------
-# 1. 데이터 수집 (USGS API)
+# 1. 데이터 로드 및 모델 학습 (캐싱)
 # -------------------------------
-@st.cache_data(ttl=3600)
-def fetch_earthquake_data(days=30):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
+@st.cache_resource
+def load_and_train():
+    wine = load_wine()
+    X = pd.DataFrame(wine.data, columns=wine.feature_names)
+    y = wine.target
+    target_names = wine.target_names
     
-    url = "https://earthquake.usgs.gov/fdsnws/event/1/query"
-    params = {
-        "format": "geojson",
-        "starttime": start_date.strftime("%Y-%m-%d"),
-        "endtime": end_date.strftime("%Y-%m-%d"),
-        "minmagnitude": 0,
-        "orderby": "time"
-    }
+    # train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        earthquakes = []
-        for feature in data["features"]:
-            coords = feature["geometry"]["coordinates"]
-            props = feature["properties"]
-            earthquakes.append({
-                "위도": coords[1],
-                "경도": coords[0],
-                "깊이_km": coords[2],
-                "규모": props["mag"],
-                "장소": props["place"],
-                "시간": datetime.fromtimestamp(props["time"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
-            })
-        
-        df = pd.DataFrame(earthquakes)
-        df = df.dropna(subset=["규모", "위도", "경도"])
-        return df
-    except Exception as e:
-        st.error(f"USGS 데이터 수집 실패: {e}")
-        return pd.DataFrame()
-
-# -------------------------------
-# 2. 클러스터링 (위험도 그룹화)
-# -------------------------------
-def assign_risk_clusters(df):
-    if df.empty:
-        return df
-    
-    features = df[["위도", "경도", "규모"]].copy()
+    # 스케일링 (RandomForest에는 필요 없지만, 일관성을 위해)
     scaler = StandardScaler()
-    scaled = scaler.fit_transform(features)
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
     
-    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-    df["cluster"] = kmeans.fit_predict(scaled)
+    # 랜덤 포레스트 분류기
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X_train_scaled, y_train)
     
-    cluster_mag = df.groupby("cluster")["규모"].mean().sort_values()
-    high_risk_cluster = cluster_mag.idxmax()
-    low_risk_cluster = cluster_mag.idxmin()
-    medium_risk_cluster = cluster_mag.index[~cluster_mag.index.isin([high_risk_cluster, low_risk_cluster])][0]
+    # 정확도 평가
+    y_pred = clf.predict(X_test_scaled)
+    acc = accuracy_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
     
-    risk_map = {
-        high_risk_cluster: "높음",
-        low_risk_cluster: "낮음",
-        medium_risk_cluster: "중간"
-    }
-    color_map = {
-        "높음": "red",
-        "낮음": "blue",
-        "중간": "green"
-    }
+    return clf, scaler, X, y, target_names, acc, cm, wine.feature_names
+
+# 모델 로드
+clf, scaler, X_full, y_full, target_names, accuracy, conf_matrix, feature_names = load_and_train()
+
+# -------------------------------
+# 2. Streamlit UI
+# -------------------------------
+st.set_page_config(page_title="와인 품종 예측", layout="wide")
+st.title("🍷 와인 품종 예측 대시보드")
+st.markdown("화학적 특성을 기반으로 **3가지 와인 품종** 중 하나를 예측합니다.")
+
+# 사이드바: 모델 성능 요약
+st.sidebar.header("📈 모델 성능")
+st.sidebar.metric("테스트 정확도", f"{accuracy:.2%}")
+st.sidebar.subheader("혼동 행렬")
+fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=target_names, yticklabels=target_names, ax=ax_cm)
+ax_cm.set_xlabel("예측")
+ax_cm.set_ylabel("실제")
+st.sidebar.pyplot(fig_cm)
+
+# 메인 화면: 입력 슬라이더 (13개 특성)
+st.subheader("🔬 와인의 화학적 특성 입력")
+cols = st.columns(2)
+input_values = []
+for i, name in enumerate(feature_names):
+    col = cols[i % 2]
+    # 각 특성의 min/max를 데이터에서 가져와 슬라이더 범위 설정
+    min_val = float(X_full[name].min())
+    max_val = float(X_full[name].max())
+    mean_val = float(X_full[name].mean())
+    val = col.slider(
+        name, 
+        min_value=min_val, 
+        max_value=max_val, 
+        value=mean_val,
+        step=(max_val - min_val) / 100,
+        help=f"범위: [{min_val:.2f}, {max_val:.2f}]"
+    )
+    input_values.append(val)
+
+# 예측 버튼
+if st.button("🍾 와인 품종 예측하기", type="primary"):
+    # 입력 배열 만들기
+    input_array = np.array(input_values).reshape(1, -1)
+    input_scaled = scaler.transform(input_array)
+    prediction = clf.predict(input_scaled)[0]
+    proba = clf.predict_proba(input_scaled)[0]
     
-    df["위험도"] = df["cluster"].map(risk_map)
-    df["색상"] = df["위험도"].map(color_map)
-    return df
-
-# -------------------------------
-# 3. Folium 지도 생성 (지구 배경 - OpenStreetMap)
-# -------------------------------
-def create_earthquake_map(df, user_lat=None, user_lon=None):
-    if not df.empty and user_lat is not None and user_lon is not None:
-        map_center = [user_lat, user_lon]
-        zoom_start = 6
-    elif not df.empty:
-        map_center = [df["위도"].mean(), df["경도"].mean()]
-        zoom_start = 2
-    else:
-        map_center = [0, 0]
-        zoom_start = 2
+    # 결과 표시
+    st.subheader("📋 예측 결과")
+    col1, col2 = st.columns(2)
+    col1.success(f"**예측된 품종:** {target_names[prediction]}")
+    col2.info(f"**신뢰도:** {max(proba)*100:.1f}%")
     
-    # OpenStreetMap은 일반 지구 지도 스타일
-    m = folium.Map(location=map_center, zoom_start=zoom_start, tiles="OpenStreetMap")
-    
-    # 지진 데이터 샘플링 (성능)
-    sample_df = df if len(df) <= 5000 else df.sample(5000, random_state=42)
-    for _, row in sample_df.iterrows():
-        folium.CircleMarker(
-            location=[row["위도"], row["경도"]],
-            radius=3,
-            color=row["색상"],
-            fill=True,
-            fill_color=row["색상"],
-            fill_opacity=0.7,
-            popup=f"규모: {row['규모']}<br>위치: {row['장소']}<br>시간: {row['시간']}"
-        ).add_to(m)
-    
-    if user_lat is not None and user_lon is not None:
-        folium.Marker(
-            location=[user_lat, user_lon],
-            icon=folium.Icon(color="black", icon="star", prefix="fa"),
-            popup="선택한 위치"
-        ).add_to(m)
-    
-    return m
+    # 확률 막대 그래프
+    st.subheader("품종별 확률 분포")
+    prob_df = pd.DataFrame({
+        "품종": target_names,
+        "확률": proba
+    })
+    fig, ax = plt.subplots()
+    sns.barplot(data=prob_df, x="품종", y="확률", palette="viridis", ax=ax)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("확률")
+    for i, p in enumerate(proba):
+        ax.text(i, p + 0.02, f"{p:.2%}", ha='center')
+    st.pyplot(fig)
 
 # -------------------------------
-# 4. 선택한 위치 주변 위험도 분석
+# 3. 특성 중요도 시각화 (Random Forest)
 # -------------------------------
-def analyze_location_risk(df, lat, lon, radius_deg=2):
-    if df.empty:
-        return "데이터 없음", 0, "데이터가 없습니다."
-    
-    nearby = df[
-        (df["위도"] >= lat - radius_deg) & (df["위도"] <= lat + radius_deg) &
-        (df["경도"] >= lon - radius_deg) & (df["경도"] <= lon + radius_deg)
-    ]
-    
-    if nearby.empty:
-        return "정보 부족", 0, f"반경 {radius_deg}° 내 지진 없음"
-    
-    risk_counts = nearby["위험도"].value_counts()
-    main_risk = risk_counts.idxmax()
-    count = len(nearby)
-    details = f"반경 {radius_deg}° 내 지진 {count}개\n위험도 분포: {risk_counts.to_dict()}"
-    return main_risk, count, details
+st.subheader("🌟 특성 중요도 (Feature Importance)")
+importance = clf.feature_importances_
+feat_imp_df = pd.DataFrame({"특성": feature_names, "중요도": importance}).sort_values("중요도", ascending=False)
+
+fig2, ax2 = plt.subplots(figsize=(10, 6))
+sns.barplot(data=feat_imp_df, x="중요도", y="특성", palette="rocket", ax=ax2)
+ax2.set_title("Random Forest 특성 중요도")
+st.pyplot(fig2)
 
 # -------------------------------
-# 5. Streamlit 앱 메인
+# 4. 원본 데이터 미리보기
 # -------------------------------
-st.set_page_config(page_title="지진 분석 대시보드", layout="wide")
-st.title("🌍 실시간 지진 분석 대시보드")
-st.markdown("USGS 지진 카탈로그(최근 30일) 데이터 기반 위험도 분석")
+with st.expander("📊 원본 데이터셋 일부 보기 (UCI Wine Dataset)"):
+    wine_data = pd.DataFrame(X_full, columns=feature_names)
+    wine_data['target'] = y_full
+    wine_data['target_name'] = wine_data['target'].map(lambda i: target_names[i])
+    st.dataframe(wine_data.head(100), use_container_width=True)
+    st.caption(f"총 {len(wine_data)}개 샘플, 13개 특성, 3개 클래스")
 
-# 데이터 로드
-with st.spinner("USGS에서 최근 30일 지진 데이터를 불러오는 중..."):
-    df_raw = fetch_earthquake_data(days=30)
-
-if df_raw.empty:
-    st.error("데이터를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
-    st.stop()
-
-df = assign_risk_clusters(df_raw)
-
-# -------------------------------
-# 사이드바: 통계 요약
-# -------------------------------
-st.sidebar.header("📊 통계 요약")
-total_eq = len(df)
-max_mag = df["규모"].max()
-avg_mag = df["규모"].mean()
-strong_eq = df[df["규모"] >= 5.0].shape[0]
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("총 지진 횟수", f"{total_eq:,}")
-col2.metric("최대 규모", f"{max_mag:.1f}")
-col3.metric("평균 규모", f"{avg_mag:.2f}")
-col4.metric("강진 횟수 (M≥5)", strong_eq)
-
-# -------------------------------
-# 지도 표시
-# -------------------------------
-st.subheader("🗺️ 지진 분포 지도 (빨강:위험 높음, 초록:중간, 파랑:낮음)")
-
-# 사용자 입력 및 위치 분석 (사이드바)
-st.sidebar.subheader("📍 위치 위험도 분석")
-user_lat = st.sidebar.number_input("위도", value=36.5, format="%.4f")
-user_lon = st.sidebar.number_input("경도", value=127.5, format="%.4f")
-radius_deg = st.sidebar.slider("분석 반경 (도)", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
-
-# 분석 버튼
-if st.sidebar.button("이 위치 분석하기"):
-    risk, cnt, details = analyze_location_risk(df, user_lat, user_lon, radius_deg)
-    st.sidebar.success(f"**위험도 판정: {risk}**")
-    st.sidebar.info(f"주변 지진 {cnt}개 기반")
-    with st.sidebar.expander("세부 정보"):
-        st.text(details)
-
-# 지도에 사용자 위치 표시 체크박스
-show_user_marker = st.sidebar.checkbox("지도에 내 위치 표시", value=True)
-if show_user_marker:
-    map_obj = create_earthquake_map(df, user_lat, user_lon)
-else:
-    map_obj = create_earthquake_map(df, None, None)
-
-folium_static(map_obj, width=1000, height=600)
-
-# -------------------------------
-# 데이터 테이블
-# -------------------------------
-st.subheader("📋 상세 지진 목록")
-display_df = df[["시간", "위도", "경도", "규모", "장소", "위험도"]].copy()
-display_df = display_df.sort_values("시간", ascending=False)
-
-page_size = 20
-total_pages = len(display_df) // page_size + 1
-page_num = st.number_input("페이지", min_value=1, max_value=total_pages, value=1)
-start_idx = (page_num - 1) * page_size
-end_idx = start_idx + page_size
-st.dataframe(display_df.iloc[start_idx:end_idx], use_container_width=True)
-
-st.caption(f"총 {len(display_df)}개 지진 기록 (최근 30일, USGS 기준)")
-
-if strong_eq > 0:
-    st.warning(f"⚠️ 지난 30일 동안 규모 5.0 이상의 강진이 {strong_eq}회 발생했습니다.")
+st.markdown("---")
+st.caption("데이터 출처: UCI Machine Learning Repository - Wine Dataset")
